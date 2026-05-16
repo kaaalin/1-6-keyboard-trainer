@@ -1,20 +1,21 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { motion } from "framer-motion";
 
-const STORAGE_KEY = "number-grid-trainer-last-run-v2";
+const TOTAL = 20;
+const MIN_DELAY = 3000;
+const MAX_DELAY = 10000;
+const STORAGE_KEY = "number-key-trainer-last-run-v2";
 const ALPHA = 0.05;
 const DIGITS = ["1", "2", "3", "4", "5", "6"];
-const GRID_SIZE = 6;
-const CELL_COUNT = GRID_SIZE * GRID_SIZE;
-const TOTAL = CELL_COUNT;
 
 function randomDigit() {
   return DIGITS[Math.floor(Math.random() * DIGITS.length)];
 }
 
-function makeGrid() {
-  return Array.from({ length: CELL_COUNT }, () => randomDigit());
+function randomDelay() {
+  return Math.floor(Math.random() * (MAX_DELAY - MIN_DELAY + 1)) + MIN_DELAY;
 }
 
 function formatSeconds(ms) {
@@ -47,12 +48,9 @@ function calculateSummary(results) {
   const typed = results.length;
   const correct = results.filter((r) => r.correct).length;
   const wrong = typed - correct;
-  const speedValues = results.map((r) => r.speedMs).filter(Number.isFinite);
-  const averageSpeedMs = speedValues.length
-    ? Math.round(speedValues.reduce((sum, value) => sum + value, 0) / speedValues.length)
-    : null;
+  const averageReactionMs = typed ? Math.round(results.reduce((sum, r) => sum + r.reactionMs, 0) / typed) : null;
   const accuracy = typed ? Math.round((correct / typed) * 100) : 0;
-  return { typed, correct, wrong, averageSpeedMs, accuracy };
+  return { typed, correct, wrong, averageReactionMs, accuracy };
 }
 
 function mean(values) {
@@ -81,7 +79,7 @@ function logGamma(z) {
     return Math.log(Math.PI) - Math.log(Math.sin(Math.PI * z)) - logGamma(1 - z);
   }
 
-  const adjusted = z - 1;
+  let adjusted = z - 1;
   let x = 0.99999999999980993;
 
   for (let i = 0; i < coefficients.length; i += 1) {
@@ -183,14 +181,15 @@ function oneVsRestWelchP(groupValues, restValues) {
 }
 
 function runAnova(results) {
-  const valid = results.filter((r) => Number.isFinite(r.speedMs));
+  const valid = results.filter((r) => Number.isFinite(r.reactionMs));
   const baseGroups = DIGITS.map((digit) => {
-    const values = valid.filter((r) => r.expected === digit).map((r) => r.speedMs);
+    const values = valid.filter((r) => r.expected === digit).map((r) => r.reactionMs);
     return {
       digit,
       values,
       n: values.length,
       meanMs: mean(values),
+      varianceMs: variance(values),
       restMeanMs: null,
       posthocP: null,
       isSlower: false,
@@ -207,7 +206,7 @@ function runAnova(results) {
     return {
       available: false,
       groups: baseGroups,
-      message: "Not enough between-keypress data for ANOVA yet.",
+      message: "Not enough data for ANOVA. Complete a full run with at least two shown-number groups.",
     };
   }
 
@@ -257,13 +256,14 @@ function runAnova(results) {
     dfBetween,
     dfWithin,
     significant: Number.isFinite(p) && p < ALPHA,
+    bonferroniAlpha,
     slowerDigits,
     message:
       Number.isFinite(p) && p < ALPHA
         ? slowerDigits.length
           ? `Significantly slower: ${slowerDigits.join(", ")}.`
           : "Overall ANOVA is significant, but no single number passes the stricter slower-number check."
-        : "No statistically significant speed difference between numbers in this run.",
+        : "No statistically significant reaction-time difference between numbers in this run.",
   };
 }
 
@@ -281,10 +281,10 @@ function AnovaPanel({ results }) {
   return (
     <div className="rounded-xl bg-neutral-950 border border-neutral-800 p-4 space-y-4">
       <div>
-        <div className="text-sm mb-1">ANOVA after full grid</div>
+        <div className="text-sm mb-1">ANOVA after 20 answers</div>
         <div className="text-lg font-semibold">{anova.message}</div>
         <div className="text-xs mt-1">
-          Timing is measured between consecutive keypresses. The first square is excluded from speed averages because it has no previous keypress.
+          Because there are only 20 trials, treat this as a training signal, not a strong scientific conclusion.
         </div>
       </div>
 
@@ -312,7 +312,7 @@ function AnovaPanel({ results }) {
       )}
 
       <div className="space-y-2">
-        <div className="text-sm">Speed by number</div>
+        <div className="text-sm">Reaction time by shown number</div>
         {sortedGroups.map((g) => (
           <div
             key={g.digit}
@@ -332,40 +332,22 @@ function AnovaPanel({ results }) {
   );
 }
 
-function cellBorderClass(index) {
-  const row = Math.floor(index / GRID_SIZE);
-  const col = index % GRID_SIZE;
-  const classes = ["border-neutral-500"];
-  if (col === 2) classes.push("border-r-4", "border-r-neutral-600");
-  if (row === 1 || row === 3) classes.push("border-b-4", "border-b-neutral-600");
-  return classes.join(" ");
-}
-
-function nextPendingIndex(marks, currentIndex) {
-  for (let index = currentIndex + 1; index < CELL_COUNT; index += 1) {
-    if (!marks[index]) return index;
-  }
-  return null;
-}
-
-export default function NumberGridTrainer() {
+export default function NumberKeyTrainer() {
   const [running, setRunning] = useState(false);
-  const [grid, setGrid] = useState(() => makeGrid());
-  const [activeIndex, setActiveIndex] = useState(null);
-  const [cellMarks, setCellMarks] = useState({});
+  const [current, setCurrent] = useState("—");
   const [round, setRound] = useState(0);
   const [typed, setTyped] = useState("");
   const [results, setResults] = useState([]);
   const [lastRun, setLastRun] = useState(null);
-  const [status, setStatus] = useState("Press Start, then fill the grid one square at a time from left to right.");
+  const [status, setStatus] = useState("Press Start, then type the shown number without looking at the keyboard.");
 
+  const timerRef = useRef(null);
   const inputRef = useRef(null);
-  const gridRef = useRef(grid);
-  const activeIndexRef = useRef(activeIndex);
+  const currentRef = useRef("—");
+  const roundRef = useRef(0);
   const runningRef = useRef(false);
-  const lastPressAtRef = useRef(null);
-  const resultsRef = useRef(results);
-  const marksRef = useRef(cellMarks);
+  const shownAtRef = useRef(null);
+  const answeredRoundRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -375,23 +357,35 @@ export default function NumberGridTrainer() {
   }, []);
 
   useEffect(() => {
-    gridRef.current = grid;
-    activeIndexRef.current = activeIndex;
+    currentRef.current = current;
+    roundRef.current = round;
     runningRef.current = running;
-    resultsRef.current = results;
-    marksRef.current = cellMarks;
-  }, [grid, activeIndex, running, results, cellMarks]);
+  }, [current, round, running]);
+
+  useEffect(() => {
+    return () => clearTimeout(timerRef.current);
+  }, []);
 
   const summary = calculateSummary(results);
-  const previousAverageMs = lastRun?.summary?.averageSpeedMs ?? null;
+  const previousAverageMs = lastRun?.summary?.averageReactionMs ?? null;
   const previousAccuracy = lastRun?.summary?.accuracy ?? null;
   const previousWrong = lastRun?.summary?.wrong ?? null;
-  const speedProgressMs =
-    Number.isFinite(summary.averageSpeedMs) && Number.isFinite(previousAverageMs)
-      ? summary.averageSpeedMs - previousAverageMs
+  const reactionProgressMs =
+    Number.isFinite(summary.averageReactionMs) && Number.isFinite(previousAverageMs)
+      ? summary.averageReactionMs - previousAverageMs
       : null;
   const accuracyProgress = results.length > 0 && Number.isFinite(previousAccuracy) ? summary.accuracy - previousAccuracy : null;
   const wrongProgress = results.length > 0 && Number.isFinite(previousWrong) ? summary.wrong - previousWrong : null;
+
+  function setDisplay(value) {
+    currentRef.current = value;
+    setCurrent(value);
+  }
+
+  function clearTimer() {
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
 
   function saveCompletedRun(finalResults) {
     const run = {
@@ -407,32 +401,60 @@ export default function NumberGridTrainer() {
     } catch {}
   }
 
-  function start() {
-    const nextGrid = makeGrid();
-    gridRef.current = nextGrid;
-    activeIndexRef.current = 0;
-    runningRef.current = true;
-    lastPressAtRef.current = null;
-    resultsRef.current = [];
-    marksRef.current = {};
+  function scheduleNext(nextRound, waitingMessage) {
+    clearTimer();
+    shownAtRef.current = null;
+    answeredRoundRef.current = null;
+    roundRef.current = Math.min(nextRound - 1, TOTAL);
 
-    setGrid(nextGrid);
-    setActiveIndex(0);
-    setCellMarks({});
+    if (nextRound > TOTAL) {
+      runningRef.current = false;
+      setRunning(false);
+      setDisplay("✓");
+      setStatus("Finished. You completed all 20 numbers.");
+      return;
+    }
+
+    setDisplay("—");
+    setStatus(waitingMessage || "Started successfully. Waiting silently for the first number…");
+
+    timerRef.current = window.setTimeout(() => {
+      const digit = randomDigit();
+      currentRef.current = digit;
+      roundRef.current = nextRound;
+      shownAtRef.current = performance.now();
+      answeredRoundRef.current = null;
+      setCurrent(digit);
+      setRound(nextRound);
+      setTyped("");
+      setStatus("Type it now.");
+      inputRef.current?.focus();
+    }, randomDelay());
+  }
+
+  function start() {
+    clearTimer();
+    runningRef.current = true;
+    roundRef.current = 0;
+    shownAtRef.current = null;
+    answeredRoundRef.current = null;
     setRunning(true);
     setResults([]);
     setRound(0);
     setTyped("");
-    setStatus("Started successfully. Fill square 1, then the cursor will move to the next square.");
+    setDisplay("—");
+    setStatus("Started successfully. Waiting silently for the first number…");
     window.setTimeout(() => inputRef.current?.focus(), 0);
+    scheduleNext(1, "Started successfully. Waiting silently for the first number…");
   }
 
   function stop() {
+    clearTimer();
     runningRef.current = false;
-    activeIndexRef.current = null;
-    lastPressAtRef.current = null;
+    shownAtRef.current = null;
+    answeredRoundRef.current = null;
     setRunning(false);
-    setActiveIndex(null);
+    setDisplay("—");
     setStatus("Stopped. Press Start to begin again.");
   }
 
@@ -443,68 +465,38 @@ export default function NumberGridTrainer() {
     } catch {}
   }
 
-  function focusTrainer() {
-    inputRef.current?.focus();
-  }
-
   function handleKeyDown(e) {
     if (!runningRef.current || isIgnorableKey(e)) return;
 
-    const index = activeIndexRef.current;
-    if (index === null || index === undefined) return;
+    const expected = currentRef.current;
+    const actual = e.key;
+    const thisRound = roundRef.current;
+
+    if (!DIGITS.includes(expected) || answeredRoundRef.current === thisRound) return;
 
     e.preventDefault();
+    answeredRoundRef.current = thisRound;
 
-    const now = performance.now();
-    const expected = gridRef.current[index];
-    const actual = e.key;
+    const reactionMs = Number.isFinite(shownAtRef.current) ? Math.round(performance.now() - shownAtRef.current) : 0;
     const actualDisplay = keyLabel(actual);
     const correct = actual === expected;
-    const nextRound = resultsRef.current.length + 1;
-    const speedMs = lastPressAtRef.current === null ? null : Math.round(now - lastPressAtRef.current);
-    const row = Math.floor(index / GRID_SIZE) + 1;
-    const col = (index % GRID_SIZE) + 1;
-    const newResult = {
-      round: nextRound,
-      expected,
-      actual: actualDisplay,
-      correct,
-      speedMs,
-      cell: index,
-      row,
-      col,
-    };
+    const newResult = { round: thisRound, expected, actual: actualDisplay, correct, reactionMs };
 
-    lastPressAtRef.current = now;
     setTyped(actualDisplay);
+    setDisplay(correct ? "✓" : "×");
 
-    const updatedMarks = { ...marksRef.current, [index]: correct ? "✓" : "×" };
-    const updatedResults = [...resultsRef.current, newResult];
-    const nextIndex = nextPendingIndex(updatedMarks, index);
+    setResults((previousResults) => {
+      if (previousResults.some((r) => r.round === thisRound)) return previousResults;
+      const updated = [...previousResults, newResult];
+      if (updated.length >= TOTAL) saveCompletedRun(updated);
+      return updated;
+    });
 
-    marksRef.current = updatedMarks;
-    resultsRef.current = updatedResults;
-    activeIndexRef.current = nextIndex;
-
-    setCellMarks(updatedMarks);
-    setResults(updatedResults);
-    setRound(nextRound);
-    setActiveIndex(nextIndex);
-
-    if (updatedResults.length >= TOTAL || nextIndex === null) {
-      runningRef.current = false;
-      activeIndexRef.current = null;
-      setRunning(false);
-      setActiveIndex(null);
-      saveCompletedRun(updatedResults);
-      setStatus("Finished. You filled the whole grid.");
-      return;
-    }
-
-    setStatus(
+    scheduleNext(
+      thisRound + 1,
       correct
-        ? `Correct ✓${speedMs === null ? "" : ` · ${formatSeconds(speedMs)}`}. Move to square ${nextIndex + 1}.`
-        : `Wrong × · expected ${expected}, typed ${actualDisplay}${speedMs === null ? "" : ` · ${formatSeconds(speedMs)}`}. Move to square ${nextIndex + 1}.`
+        ? `Correct logged · ${formatSeconds(reactionMs)}. Waiting silently…`
+        : `Wrong logged · expected ${expected}, typed ${actualDisplay} · ${formatSeconds(reactionMs)}. Waiting silently…`
     );
   }
 
@@ -513,17 +505,17 @@ export default function NumberGridTrainer() {
 
     if (results.length === 0) {
       return `Previous: ${lastRun.summary.accuracy}% accuracy, ${lastRun.summary.wrong} wrong, ${formatSeconds(
-        lastRun.summary.averageSpeedMs
-      )} avg between keypresses.`;
+        lastRun.summary.averageReactionMs
+      )} avg reaction.`;
     }
 
-    const speedPart =
-      speedProgressMs === null
-        ? "speed —"
-        : speedProgressMs < 0
-          ? `${formatSeconds(Math.abs(speedProgressMs))} faster`
-          : speedProgressMs > 0
-            ? `${formatSeconds(speedProgressMs)} slower`
+    const reactionPart =
+      reactionProgressMs === null
+        ? "reaction —"
+        : reactionProgressMs < 0
+          ? `${formatSeconds(Math.abs(reactionProgressMs))} faster`
+          : reactionProgressMs > 0
+            ? `${formatSeconds(reactionProgressMs)} slower`
             : "same speed";
     const accuracyPart =
       accuracyProgress === null
@@ -542,16 +534,28 @@ export default function NumberGridTrainer() {
             ? `${wrongProgress} more wrong`
             : "same wrong count";
 
-    return `Vs previous run: ${speedPart}, ${accuracyPart}, ${wrongPart}.`;
+    return `Vs previous run: ${reactionPart}, ${accuracyPart}, ${wrongPart}.`;
   }
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6 [&_*]:text-white" onClick={focusTrainer}>
-      <Card className="w-full max-w-3xl bg-neutral-900 border-neutral-800 shadow-2xl rounded-2xl">
+    <div className="min-h-screen bg-neutral-950 text-white flex items-center justify-center p-6 [&_*]:text-white">
+      <Card className="w-full max-w-2xl bg-neutral-900 border-neutral-800 shadow-2xl rounded-2xl">
         <CardContent className="p-8 space-y-6">
           <div className="space-y-2 text-center">
-            <h1 className="text-3xl font-semibold tracking-tight">1–6 Grid Keyboard Trainer</h1>
-            <p>Fill the full grid one by one · type the active light-grey number · timing between keypresses</p>
+            <h1 className="text-3xl font-semibold tracking-tight">1–6 Keyboard Trainer</h1>
+            <p>20 random numbers · random 3–10 second intervals · no Enter needed</p>
+          </div>
+
+          <div className="flex justify-center">
+            <motion.div
+              key={current}
+              initial={{ scale: 0.75, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ duration: 0.18 }}
+              className="w-36 h-36 rounded-2xl bg-neutral-800 border border-neutral-700 flex items-center justify-center text-7xl font-bold tabular-nums"
+            >
+              {current}
+            </motion.div>
           </div>
 
           <input
@@ -562,40 +566,12 @@ export default function NumberGridTrainer() {
             inputMode="numeric"
             autoFocus
             className="sr-only"
-            aria-label="Type the active square number"
+            aria-label="Type the displayed number"
           />
-
-          <div className="flex justify-center">
-            <div className="grid grid-cols-6 w-full max-w-[480px] aspect-square rounded-md overflow-hidden border-4 border-neutral-600 bg-neutral-100">
-              {grid.map((digit, index) => {
-                const active = activeIndex === index;
-                const mark = cellMarks[index];
-                const done = Boolean(mark);
-
-                return (
-                  <button
-                    key={`${index}-${digit}`}
-                    type="button"
-                    onClick={focusTrainer}
-                    className={`relative bg-neutral-50 border border-neutral-400 flex items-center justify-center text-3xl md:text-4xl font-semibold tabular-nums transition ${cellBorderClass(index)} ${
-                      active ? "ring-4 ring-inset ring-neutral-900 bg-neutral-200" : ""
-                    } ${done ? "bg-neutral-100" : ""}`}
-                  >
-                    <span className="!text-neutral-400">{digit}</span>
-                    {mark && (
-                      <span className={`absolute inset-0 flex items-center justify-center text-5xl font-black ${mark === "✓" ? "!text-green-700" : "!text-red-700"}`}>
-                        {mark}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
 
           <div className="text-center space-y-1">
             <p className="text-lg">{status}</p>
-            <p>{`Filled ${Math.min(round, TOTAL)} / ${TOTAL}`}</p>
+            <p>{`Round ${Math.min(round, TOTAL)} / ${TOTAL}`}</p>
             <p className="text-sm">{progressText()}</p>
           </div>
 
@@ -617,8 +593,8 @@ export default function NumberGridTrainer() {
               <div className="text-xs uppercase tracking-wide">accuracy</div>
             </div>
             <div className="rounded-xl bg-neutral-800 p-3 col-span-2 md:col-span-1">
-              <div className="text-2xl font-semibold">{formatSeconds(summary.averageSpeedMs)}</div>
-              <div className="text-xs uppercase tracking-wide">avg speed</div>
+              <div className="text-2xl font-semibold">{formatSeconds(summary.averageReactionMs)}</div>
+              <div className="text-xs uppercase tracking-wide">avg reaction</div>
             </div>
           </div>
 
@@ -639,7 +615,7 @@ export default function NumberGridTrainer() {
           <div className="rounded-xl bg-neutral-950 border border-neutral-800 p-4 min-h-28">
             <div className="flex justify-between gap-3 text-sm mb-3">
               <span>History</span>
-              <span>{results.length ? "actual / expected · cell · speed" : ""}</span>
+              <span>{results.length ? "actual / expected · reaction" : ""}</span>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {results.length === 0 ? (
@@ -651,14 +627,13 @@ export default function NumberGridTrainer() {
                     className={`flex items-center justify-between gap-3 px-3 py-2 rounded-lg text-sm ${
                       r.correct ? "bg-neutral-800" : "bg-neutral-700"
                     }`}
-                    title={`Round ${r.round}: row ${r.row}, column ${r.col}, expected ${r.expected}, typed ${r.actual}`}
+                    title={`Round ${r.round}: expected ${r.expected}, typed ${r.actual}`}
                   >
                     <span className="tabular-nums">#{String(r.round).padStart(2, "0")}</span>
                     <span className="font-semibold tabular-nums">
                       {r.correct ? "✓" : "×"} {r.actual}/{r.expected}
                     </span>
-                    <span className="tabular-nums">r{r.row} c{r.col}</span>
-                    <span className="tabular-nums">{formatSeconds(r.speedMs)}</span>
+                    <span className="tabular-nums">{formatSeconds(r.reactionMs)}</span>
                   </div>
                 ))
               )}
